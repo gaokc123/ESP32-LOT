@@ -1,0 +1,18 @@
+--- Python 后端垃圾文件 ---
+
+pycache/
+*.py[cod]
+*$py.class
+db.sqlite3
+.DS_Store
+
+--- React 前端垃圾文件 (非常重要，这个文件夹巨大) ---
+
+node_modules/
+dist/
+.env.local
+
+--- 编辑器临时文件 ---
+
+.vscode/
+.idea/
