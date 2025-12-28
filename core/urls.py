@@ -27,10 +27,15 @@ urlpatterns = [
 
 from django.contrib import admin
 from django.urls import path, include  # <--- 注意：这里要多导入一个 include
-
+from django.conf import settings
+from django.conf.urls.static import static
 urlpatterns = [
     path('admin/', admin.site.urls),
     
     # 意思是：凡是以 'api/' 开头的网址，都转交给 device_api 去处理
     path('api/', include('device_api.urls')),
 ]
+
+# --- 新增：开发模式下提供文件访问服务 ---
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

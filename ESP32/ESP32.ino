@@ -1,309 +1,380 @@
 #include <Arduino.h>
-#include <driver/i2s.h>        // ESP32 专用的 I2S 音频驱动库
-#include <Wire.h>              // Arduino 标准 I2C 通信库
-#include <Adafruit_GFX.h>      // Adafruit 图形库核心（画点、线、圆等）
-#include <Adafruit_SSD1306.h>  // SSD1306 OLED 屏幕驱动库
+#include <WiFi.h>
+#include <driver/i2s.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// ==========================================
-//               硬件引脚定义
-// ==========================================
+// ================= 用户配置区 (必须修改!) =================
+const char* ssid     = "Bone";          // WiFi 名称
+const char* password = "12345678";      // WiFi 密码
+// 电脑 IP 地址 (Django 后端服务器地址)
+// 注意：这个 IP 地址必须是你电脑在局域网内的 IP，不能是 127.0.0.1
+// 可以在电脑终端输入 ipconfig 查看
+const char* host     = "172.20.10.5"; 
+const int   httpPort = 8000;            // Django 默认端口
+const char* url      = "/api/upload/";  // 后端上传接口地址
 
-// --- 麦克风 INMP441 (I2S 输入) ---
-// I2S 是一种专门传输音频数据的协议，比模拟信号更抗干扰
-#define MIC_I2S_WS   4    // 字选择 (Word Select)，用于区分左右声道
-#define MIC_I2S_SCK  5    // 串行时钟 (Serial Clock)
-#define MIC_I2S_SD   6    // 串行数据 (Serial Data)，麦克风的数据从这进来
+// ================= 全局参数 =================
+#define SAMPLE_RATE     16000           // 采样率 16kHz (人声清晰度足够)
+#define MAX_RECORD_SEC  10              // 最大录音时长 (秒)
+size_t record_size = 0;                 // 录音缓冲区大小 (字节)，在 setup 中计算
+int16_t *rec_buffer = NULL;             // 指向录音数据的指针
+int current_rec_len = 0;                // 当前实际录制的长度
 
-// --- 功放 MAX98357A (I2S 输出) ---
-#define AMP_I2S_LRC  16   // 左右时钟 (Left/Right Clock)，同 WS
-#define AMP_I2S_BCLK 15   // 位时钟 (Bit Clock)
-#define AMP_I2S_DIN  7    // 数据输入 (Data In)，ESP32 把数据发给功放
+// ================= 硬件引脚定义 =================
+// 麦克风 (INMP441) I2S 引脚
+#define MIC_I2S_WS   4
+#define MIC_I2S_SCK  5
+#define MIC_I2S_SD   6
 
-// --- 音量控制按键 ---
-// 注意：ESP32 的某些引脚（如34-39）是仅输入的，没有内部上拉电阻。
-// 如果你的板子上没有外部上拉电阻，按键可能无法稳定工作。
-#define PIN_VOL_UP   39   // 音量加
-#define PIN_VOL_DOWN 40   // 音量减
+// 扬声器 (MAX98357A) I2S 引脚
+#define AMP_I2S_LRC  16
+#define AMP_I2S_BCLK 15
+#define AMP_I2S_DIN  7
 
-// --- OLED 屏幕 (0.91寸 SSD1306) ---
-// AI小智通常使用 ESP32-S3，SDA/SCL 可以任意映射
-#define SCREEN_SDA   41   // I2C 数据线
-#define SCREEN_SCL   42   // I2C 时钟线
-#define SCREEN_WIDTH 128  // 屏幕宽度像素
-#define SCREEN_HEIGHT 32  // 屏幕高度像素
-#define OLED_RESET   -1   // 复位引脚，-1 表示通过软件复位，不占用IO
-#define SCREEN_ADDRESS 0x3C // I2C 地址，通常是 0x3C，少部分是 0x3D
+// 录音按键引脚 (GPIO 39)
+// 注意：有些开发板 GPIO 0 是 Boot 键，这里改用 39
+#define PIN_RECORD_BTN 39  
 
-// 创建屏幕对象，后续所有屏幕操作都通过 display 变量调用
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// OLED 屏幕 I2C 引脚
+#define SCREEN_SDA   41
+#define SCREEN_SCL   42
+// OLED 对象初始化
+Adafruit_SSD1306 display(128, 32, &Wire, -1);
 
-// ==========================================
-//               音频与系统参数
-// ==========================================
+// ================= 状态标志 =================
+TaskHandle_t RecordTaskHandle = NULL;   // RTOS 任务句柄，用于任务间通信
 
-// 采样率 16000Hz：人声范围通常在 300Hz-3400Hz，16k 足够清晰且占用资源少
-#define SAMPLE_RATE     16000
-// DMA 缓冲区设置：
-// 缓冲区数量越多，抗卡顿能力越强，但延迟越高；
-// 单个缓冲区越长，中断次数越少，但延迟越高。
-// 8 * 128 是一个平衡延迟和稳定性的配置。
-#define DMA_BUF_COUNT   8
-#define DMA_BUF_LEN     128
-// 总处理缓冲区大小
-#define BUFFER_SIZE     1024
-
-int16_t *audio_buffer; // 音频数据指针，指向一块动态分配的内存
-
-// ==========================================
-//               音量控制逻辑
-// ==========================================
-
-int volume_level = 5;         // 当前音量档位 (0-9)，默认开机是 5
-float current_gain = 4.0;     // 当前数字增益倍数
-
-// 增益表：人耳对音量的感知是非线性的，所以我们用查表法
-// 0档静音，随着档位增加，放大的倍数越来越大
-const float gain_table[10] = {
-    0.0f,  0.5f,  1.0f,  2.0f,  3.0f, 
-    4.0f,  6.0f,  8.0f,  12.0f, 16.0f
-};
-
-// ==========================================
-//               硬件初始化函数
-// ==========================================
-
-// --- 初始化麦克风 (I2S1 端口) ---
-void init_mic() {
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX), // 主机模式，接收数据(RX)
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,        // 16位深度，CD音质也是16位
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,         // 只取左声道数据
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,   // 标准 I2S 格式
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,            // 中断优先级
-        .dma_buf_count = DMA_BUF_COUNT,
-        .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = false                                    // 不使用高精度时钟，省电
-    };
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = MIC_I2S_SCK,
-        .ws_io_num = MIC_I2S_WS,
-        .data_out_num = I2S_PIN_NO_CHANGE, // 麦克风不需要输出引脚
-        .data_in_num = MIC_I2S_SD          // 数据从这里读入
-    };
-    // 安装驱动并设置引脚
-    i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_1, &pin_config);
+// ================= UI 辅助函数 =================
+// 在 OLED 屏幕上显示状态信息
+// title: 主标题 (大字)
+// subtitle: 副标题 (小字)
+void showStatus(String title, String subtitle = "") {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println(title);
+  
+  if(subtitle != "") {
+    display.setCursor(0, 16);
+    display.println(subtitle);
+  }
+  display.display();
+  Serial.println(title + " " + subtitle); // 同时打印到串口方便调试
 }
 
-// --- 初始化功放 (I2S0 端口) ---
-void init_speaker() {
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX), // 主机模式，发送数据(TX)
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = DMA_BUF_COUNT,
-        .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = false
-    };
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = AMP_I2S_BCLK,
-        .ws_io_num = AMP_I2S_LRC,
-        .data_out_num = AMP_I2S_DIN,       // 数据从这里发出去
-        .data_in_num = I2S_PIN_NO_CHANGE   // 功放不需要输入引脚
-    };
-    // 安装驱动并设置引脚
-    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_0, &pin_config);
+// ================= I2S 初始化 =================
+// 配置 I2S 接口，分别用于麦克风输入 (I2S_NUM_0) 和扬声器输出 (I2S_NUM_1)
+void i2s_install() {
+  // --- 配置麦克风 (I2S0) ---
+  i2s_config_t i2s_config_mic = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX), // 主机模式，接收数据
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,        // 16位采样精度
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,         // 单声道 (左声道)
+    .communication_format = I2S_COMM_FORMAT_I2S,         // 标准 I2S 格式
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,                                  // DMA 缓冲区数量
+    .dma_buf_len = 64,                                   // 每个缓冲区长度
+    .use_apll = false
+  };
+  i2s_driver_install(I2S_NUM_0, &i2s_config_mic, 0, NULL);
+  
+  i2s_pin_config_t pin_config_mic = {
+    .bck_io_num = MIC_I2S_SCK,
+    .ws_io_num = MIC_I2S_WS,
+    .data_out_num = -1,            // 麦克风不需要输出引脚
+    .data_in_num = MIC_I2S_SD      // 麦克风数据输入引脚
+  };
+  i2s_set_pin(I2S_NUM_0, &pin_config_mic);
+
+  // --- 配置扬声器 (I2S1) ---
+  i2s_config_t i2s_config_amp = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX), // 主机模式，发送数据
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+  };
+  i2s_driver_install(I2S_NUM_1, &i2s_config_amp, 0, NULL);
+  
+  i2s_pin_config_t pin_config_amp = {
+    .bck_io_num = AMP_I2S_BCLK,
+    .ws_io_num = AMP_I2S_LRC,
+    .data_out_num = AMP_I2S_DIN,   // 扬声器数据输出引脚
+    .data_in_num = -1              // 扬声器不需要输入引脚
+  };
+  i2s_set_pin(I2S_NUM_1, &pin_config_amp);
 }
 
-// ==========================================
-//               核心音频任务
-// ==========================================
-// 这是一个 FreeRTOS 任务，独立于 loop() 运行，专门负责搬运音频数据
-void audio_pass_through_task(void *pvParameters) {
-    size_t bytes_read = 0;
-    size_t bytes_written = 0;
-    int32_t processed_sample = 0; // 用 32位整数暂存计算结果，防止计算溢出
+// 创建 WAV 文件头
+// PCM 音频数据是“裸数据”，需要加上这个 44 字节的头，播放器才能识别
+void createWavHeader(uint8_t *header, int waveDataSize) {
+  int sampleRate = SAMPLE_RATE;
+  int byteRate = sampleRate * 2; // 16bit = 2bytes
+  int totalDataLen = waveDataSize + 36;
+  
+  // RIFF Chunk
+  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  header[4] = (byte)(totalDataLen & 0xFF);
+  header[5] = (byte)((totalDataLen >> 8) & 0xFF);
+  header[6] = (byte)((totalDataLen >> 16) & 0xFF);
+  header[7] = (byte)((totalDataLen >> 24) & 0xFF);
+  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+  
+  // fmt Chunk
+  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0; // Chunk size: 16
+  header[20] = 1; header[21] = 0; // Format code: 1 (PCM)
+  header[22] = 1; header[23] = 0; // Channels: 1 (Mono)
+  header[24] = (byte)(sampleRate & 0xFF);
+  header[25] = (byte)((sampleRate >> 8) & 0xFF);
+  header[26] = (byte)((sampleRate >> 16) & 0xFF);
+  header[27] = (byte)((sampleRate >> 24) & 0xFF);
+  header[28] = (byte)(byteRate & 0xFF);
+  header[29] = (byte)((byteRate >> 8) & 0xFF);
+  header[30] = (byte)((byteRate >> 16) & 0xFF);
+  header[31] = (byte)((byteRate >> 24) & 0xFF);
+  header[32] = 2; header[33] = 0; // Block align: 2 bytes
+  header[34] = 16; header[35] = 0; // Bits per sample: 16
+  
+  // data Chunk
+  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  header[40] = (byte)(waveDataSize & 0xFF);
+  header[41] = (byte)((waveDataSize >> 8) & 0xFF);
+  header[42] = (byte)((waveDataSize >> 16) & 0xFF);
+  header[43] = (byte)((waveDataSize >> 24) & 0xFF);
+}
 
-    Serial.println("[Audio] 实时透传任务启动...");
+// ================= 上传函数 =================
+// 将录制好的音频数据通过 HTTP POST 上传到服务器
+void performUpload() {
+  // 1. 检查 WiFi 连接
+  if (WiFi.status() != WL_CONNECTED) {
+    showStatus("Error:", "WiFi Lost!");
+    return;
+  }
+  
+  // 2. 连接服务器
+  showStatus("Connecting...", host);
+  WiFiClient client;
+  if (!client.connect(host, httpPort)) {
+    showStatus("Error:", "Connect Fail"); // 连接失败
+    return;
+  }
+  
+  // 3. 准备上传
+  showStatus("Uploading...", String(current_rec_len/1024) + " KB");
 
-    while (true) {
-        // 1. 从麦克风读取数据 (I2S_NUM_1)
-        // portMAX_DELAY 表示如果没有数据，程序会在这里一直等，不会往下跑
-        i2s_read(I2S_NUM_1, audio_buffer, BUFFER_SIZE * sizeof(int16_t), &bytes_read, portMAX_DELAY);
+  // 构建 HTTP Multipart 表单数据
+  String boundary = "ESP32Boundary"; // 分隔符
+  String bodyHead = "--" + boundary + "\r\n";
+  bodyHead += "Content-Disposition: form-data; name=\"audio_file\"; filename=\"s3_audio.wav\"\r\n";
+  bodyHead += "Content-Type: audio/wav\r\n\r\n";
+  String bodyTail = "\r\n--" + boundary + "--\r\n";
 
-        // 获取当前的音量放大倍数
-        float gain = current_gain; 
+  // 计算总内容长度 = 头部 + WAV头(44字节) + 音频数据 + 尾部
+  int wavHeaderSize = 44;
+  int totalContentLen = bodyHead.length() + wavHeaderSize + current_rec_len + bodyTail.length();
 
-        // 2. 数字信号处理 (DSP) - 调整音量
-        // bytes_read 是字节数，每个样本是 16位(2字节)，所以循环次数要除以 2
-        for(int i = 0; i < bytes_read / 2; i++) {
-            // 核心算法：原始声音 * 放大倍数
-            processed_sample = (int32_t)(audio_buffer[i] * gain);
+  // 4. 发送 HTTP 请求头
+  client.println("POST " + String(url) + " HTTP/1.1");
+  client.println("Host: " + String(host));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.print("Content-Length: "); client.println(totalContentLen);
+  client.println(); // 空行表示请求头结束
 
-            // 3. 防止破音 (Clipping)
-            // 16位音频的最大值是 32767，最小值是 -32768
-            // 如果放大后超过这个范围，声音会通过“削顶”产生刺耳的爆音
-            // 所以必须强制限制在这个范围内
-            if (processed_sample > 32767) processed_sample = 32767;
-            else if (processed_sample < -32768) processed_sample = -32768;
+  // 5. 发送数据体
+  client.print(bodyHead); // 发送表单头
+  
+  uint8_t wavHeader[44];
+  createWavHeader(wavHeader, current_rec_len); // 生成 WAV 头
+  client.write(wavHeader, 44); // 发送 WAV 头
 
-            // 将处理后的 32位数据转回 16位存回去
-            audio_buffer[i] = (int16_t)processed_sample;
-        }
+  // 分块发送音频数据 (防止一次发太大内存溢出)
+  int chunkSize = 2048;
+  int sent = 0;
+  uint8_t *byteBuffer = (uint8_t *)rec_buffer; 
+  while (sent < current_rec_len) {
+    int toSend = (current_rec_len - sent) > chunkSize ? chunkSize : (current_rec_len - sent);
+    client.write(byteBuffer + sent, toSend);
+    sent += toSend;
+  }
+  client.print(bodyTail); // 发送表单尾部
 
-        // 4. 将处理好的数据写入功放 (I2S_NUM_0)
-        i2s_write(I2S_NUM_0, audio_buffer, bytes_read, &bytes_written, portMAX_DELAY);
+  // 6. 等待服务器响应
+  long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 10000) { // 10秒超时
+      showStatus("Error:", "Timeout");
+      client.stop();
+      return;
     }
+  }
+  
+  client.stop(); // 断开连接
+  showStatus("Success!", "Sent OK"); // 上传成功提示
+  delay(1500); // 停留一下，让用户看到成功提示
 }
 
-// ==========================================
-//               辅助功能函数 (UI更新)
-// ==========================================
+// ================= 主逻辑任务 (RTOS 任务) =================
+// 负责：待机 -> 录音 -> 处理 -> 回放 -> 上传 的全流程
+void AudioTask(void *pvParameters) {
+  // 1. 启动时先清空所有通知，防止误触发
+  ulTaskNotifyTake(pdTRUE, 0);
 
-// --- 刷新 OLED 屏幕显示 ---
-void refresh_oled_display() {
-    display.clearDisplay(); // 清除显存，准备画新的一帧
+  while (true) {
+    // === 阶段 0: 待机 ===
+    showStatus("Ready", "Press to Start");
+    Serial.println("[Audio] Waiting for button...");
     
-    // 1. 显示文字标题
-    display.setTextSize(1);              // 字体大小 1
-    display.setTextColor(SSD1306_WHITE); // 白色字
-    display.setCursor(0, 0);             // 坐标原点在左上角 (0,0)
-    display.print("Volume: ");
-    display.print(volume_level);
-    display.print(" / 9");
+    // 阻塞等待开始信号 (RTOS 特性：没信号时挂起，不占 CPU)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    
+    // === 阶段 1: 录音中 ===
+    Serial.println("[Audio] Start Recording");
+    current_rec_len = 0;
+    showStatus("Recording...", "Press to Stop");
+    
+    size_t bytes_read;
+    int chunk = 1024;
+    
+    // 循环录音
+    // 退出条件：收到停止信号(ulTaskNotifyTake > 0) 或者 内存存满了
+    while((current_rec_len + chunk < record_size)) {
+       // 检查是否有停止信号 (非阻塞检查)
+       // 如果 ButtonTask 再次发来信号，说明用户第二次按下了按键，意图停止
+       if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+          Serial.println("[Audio] Stop signal received");
+          break; // 跳出循环，结束录音
+       }
 
-    // 2. 绘制音量进度条 (图形化)
-    // drawRect 画空心框：x=0, y=12, 宽=128, 高=10
-    display.drawRect(0, 12, 128, 10, SSD1306_WHITE);
-    
-    // 计算实心条的宽度
-    // map函数将 0-9 的档位映射到 0-126 像素宽度
-    int bar_width = map(volume_level, 0, 9, 0, 126);
-    
-    // fillRect 画实心矩形：用来表示当前进度
-    if (bar_width > 0) {
-        display.fillRect(2, 14, bar_width, 6, SSD1306_WHITE);
+       // 从麦克风读取数据存入 rec_buffer
+       i2s_read(I2S_NUM_0, (uint8_t*)rec_buffer + current_rec_len, chunk, &bytes_read, portMAX_DELAY);
+       current_rec_len += bytes_read;
     }
+    
+    // === 阶段 2: 处理 ===
+    showStatus("Processing...", String(current_rec_len) + " bytes");
+    vTaskDelay(pdMS_TO_TICKS(500)); // 稍作延时
 
-    // 3. 显示增益倍数 (底部小字)
-    display.setCursor(0, 24);
-    display.print("Gain: ");
-    display.print(current_gain, 1); // 保留1位小数
-    display.print("x");
-
-    // 非常重要！不调用 display() 屏幕是什么都不会显示的
-    display.display(); 
-}
-
-// --- 更新音量 ---
-void update_volume(int change) {
-    int old_level = volume_level;
-    volume_level += change; // 增加或减少音量
-
-    // 限制范围在 0-9 之间
-    if (volume_level > 9) volume_level = 9;
-    if (volume_level < 0) volume_level = 0;
-
-    // 只有音量真正改变了，或者强制刷新(change==0)时，才更新状态
-    if (volume_level != old_level || change == 0) {
-        // 从查找表中获取对应的放大倍数
-        current_gain = gain_table[volume_level];
-
-        // 1. 串口打印调试信息
-        Serial.print("音量等级: ");
-        Serial.print(volume_level);
-        Serial.print(" (增益: ");
-        Serial.print(current_gain);
-        Serial.println(")");
-
-        // 2. 刷新屏幕显示 UI
-        refresh_oled_display();
+    // === 阶段 3: 本地回放 ===
+    // 让你听到刚才录了什么，确认录音正常
+    showStatus("Playing...", "Listen...");
+    size_t bytes_written;
+    int sent = 0;
+    while(sent < current_rec_len) {
+       int toSend = (current_rec_len - sent) > chunk ? chunk : (current_rec_len - sent);
+       // 将数据写入扬声器 I2S 接口
+       i2s_write(I2S_NUM_1, (uint8_t*)rec_buffer + sent, toSend, &bytes_written, portMAX_DELAY);
+       sent += toSend;
     }
+    
+    // === 阶段 4: 上传 ===
+    performUpload();
+    
+    // === 阶段 5: 复位 ===
+    // 关键：上传完后，再次清空可能积累的误触信号，确保回到 Ready 状态是干净的
+    ulTaskNotifyTake(pdTRUE, 0);
+    Serial.println("[Audio] Cycle done, resetting...");
+  }
 }
 
-// ==========================================
-//               Arduino Setup (初始化)
-// ==========================================
+// ================= 按键扫描任务 (RTOS 任务) =================
+// 负责：实时检测按键，消除抖动，向主任务发送信号
+void ButtonTask(void *pvParameters) {
+  // 1. 启动延时：给系统一点时间稳定，防止上电抖动
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  
+  // 2. 状态校验：如果上电时按键就是按下的，等待它松开，防止开机误触
+  while(digitalRead(PIN_RECORD_BTN) == LOW) {
+     vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  // 读取初始状态
+  bool lastState = digitalRead(PIN_RECORD_BTN);
+  
+  while (true) {
+    bool currentState = digitalRead(PIN_RECORD_BTN);
+    
+    // 检测按下瞬间 (状态由 HIGH 变为 LOW)
+    // 假设按键接了上拉电阻，按下为 LOW
+    if (lastState == HIGH && currentState == LOW) {
+      vTaskDelay(pdMS_TO_TICKS(50)); // 消抖延时
+      if(digitalRead(PIN_RECORD_BTN) == LOW) {
+         Serial.println("[Btn] Pressed!");
+         
+         // 发送信号给 AudioTask
+         // 如果 AudioTask 在睡觉(待机)，它会醒来开始录音
+         // 如果 AudioTask 在录音，它会收到信号停止录音
+         xTaskNotifyGive(RecordTaskHandle);
+         
+         // 等待松开，防止一次按下被识别为多次
+         while(digitalRead(PIN_RECORD_BTN) == LOW) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+         }
+      }
+    }
+    
+    lastState = currentState;
+    vTaskDelay(pdMS_TO_TICKS(50)); // 扫描频率 50ms
+  }
+}
+
+// ================= Setup 初始化 =================
 void setup() {
-    Serial.begin(115200); // 开启串口调试
-    delay(1000);
+  Serial.begin(115200);
+  
+  // 1. 初始化 OLED 屏幕
+  Wire.begin(SCREEN_SDA, SCREEN_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  showStatus("Booting...");
 
-    // --- 1. 初始化 I2C 和 OLED 屏幕 ---
-    // ESP32 允许自定义 I2C 引脚，这里设置为 SDA=41, SCL=42
-    Wire.begin(SCREEN_SDA, SCREEN_SCL);
+  // 2. 内存分配 (PSRAM 检测)
+  // 如果有 PSRAM (外部RAM)，可以录制更长时间
+  if(psramFound()){
+    record_size = SAMPLE_RATE * 2 * MAX_RECORD_SEC;
+    rec_buffer = (int16_t *)ps_malloc(record_size); // 申请 PSRAM
+    Serial.println("PSRAM OK");
+  } else {
+    // 如果没有 PSRAM，只能录短一点，防止内存溢出
+    record_size = SAMPLE_RATE * 2 * 4; 
+    rec_buffer = (int16_t *)malloc(record_size);    // 申请内部 RAM
+    Serial.println("No PSRAM");
+  }
+  
+  // 内存申请失败处理
+  if (rec_buffer == NULL) {
+    showStatus("Mem Error!");
+    while(1);
+  }
 
-    // SSD1306_SWITCHCAPVCC 表示内部产生 3.3V->7V 的显示电压
-    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println(F("SSD1306 allocation failed (屏幕初始化失败)"));
-        // 如果屏幕坏了，这里不写 while(1)，让音频功能依然能工作
-    } else {
-        Serial.println(F("OLED Init Success!"));
-        display.clearDisplay();
-        display.display(); // 刚开机清屏
-    }
+  // 3. 初始化按键和 I2S
+  pinMode(PIN_RECORD_BTN, INPUT_PULLUP);
+  i2s_install();
 
-    // --- 2. 硬件初始化 ---
-    pinMode(PIN_VOL_UP, INPUT_PULLUP);   // 设置按键为输入上拉模式
-    pinMode(PIN_VOL_DOWN, INPUT_PULLUP);
+  // 4. 连接 WiFi
+  showStatus("Connecting WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
 
-    // 申请内存用于存放音频数据
-    // ps_malloc 优先从 PSRAM (外部伪静态随机存储器) 申请，这部分内存很大(几MB)
-    audio_buffer = (int16_t *)ps_malloc(BUFFER_SIZE * sizeof(int16_t));
-    if (audio_buffer == NULL) {
-        // 如果没有 PSRAM (比如普通 ESP32)，则回退到内部 RAM 申请
-        Serial.println("PSRAM 内存分配失败！尝试使用内部 RAM...");
-        audio_buffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-        // 如果内部 RAM 也不够，那就只能卡死在这里了
-        if (audio_buffer == NULL) while (1);
-    }
-
-    // 初始化音频驱动
-    init_mic();
-    init_speaker();
-    
-    // 初始化并显示一次默认音量
-    update_volume(0); 
-
-    // --- 3. 创建音频任务 ---
-    // xTaskCreatePinnedToCore: 创建一个 FreeRTOS 任务
-    // "AudioTask": 任务名字
-    // 8192: 栈大小 (字节)，音频处理需要较大栈空间
-    // NULL: 参数
-    // 5: 优先级 (很高)，保证音频不卡顿
-    // NULL: 任务句柄
-    // 0: 运行在 CPU 核心 0 上 (Arduino 的 loop 默认在核心 1)
-    xTaskCreatePinnedToCore(audio_pass_through_task, "AudioTask", 8192, NULL, 5, NULL, 0);
-
-    Serial.println("系统就绪。");
+  // 5. 创建 RTOS 任务
+  // xTaskCreatePinnedToCore(任务函数, 任务名, 栈大小, 参数, 优先级, 句柄, 核心ID)
+  // AudioTask 优先级高 (3)，确保录音不卡顿，运行在核心 1
+  xTaskCreatePinnedToCore(AudioTask, "AudioTask", 10240, NULL, 3, &RecordTaskHandle, 1);
+  // ButtonTask 优先级中 (2)，运行在核心 1
+  xTaskCreatePinnedToCore(ButtonTask, "BtnTask", 2048, NULL, 2, NULL, 1);
 }
 
-// ==========================================
-//               Arduino Loop (主循环)
-// ==========================================
-unsigned long last_debounce_time = 0;
-const unsigned long debounce_delay = 200; // 防抖时间 200ms
-
+// ================= Loop =================
 void loop() {
-    // 读取按键状态 (因为是 INPUT_PULLUP，所以按下是 LOW)
-    bool btn_up_pressed = (digitalRead(PIN_VOL_UP) == LOW);
-    bool btn_down_pressed = (digitalRead(PIN_VOL_DOWN) == LOW);
-
-    // 简单的按键防抖逻辑
-    if ((millis() - last_debounce_time) > debounce_delay) {
-        if (btn_up_pressed) {
-            update_volume(1); // 音量 +1
-            last_debounce_time = millis(); // 记录当前时间，防止连击
-        } 
-        else if (btn_down_pressed) {
-            update_volume(-1); // 音量 -1
-            last_debounce_time = millis();
-        }
-    }
-    // 延时一小会儿，让出 CPU 给其他低优先级任务（比如 WiFi 后台任务）
-    vTaskDelay(pdMS_TO_TICKS(50));
+  // 主循环空闲，因为任务都由 RTOS 调度管理
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
