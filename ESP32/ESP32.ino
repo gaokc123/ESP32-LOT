@@ -33,7 +33,6 @@ int current_rec_len = 0;                // 当前实际录制的长度
 #define AMP_I2S_DIN  7
 
 // 录音按键引脚 (GPIO 39)
-// 注意：有些开发板 GPIO 0 是 Boot 键，这里改用 39
 #define PIN_RECORD_BTN 39  
 
 // OLED 屏幕 I2C 引脚
@@ -64,34 +63,41 @@ void showStatus(String title, String subtitle = "") {
   Serial.println(title + " " + subtitle); // 同时打印到串口方便调试
 }
 
-// ================= I2S 初始化 =================
-// 配置 I2S 接口，分别用于麦克风输入 (I2S_NUM_0) 和扬声器输出 (I2S_NUM_1)
+// ================= I2S 初始化函数 =================
+// 作用：配置 ESP32 的 I2S 硬件接口，使其能够与麦克风和扬声器通信。
+// 原理：ESP32 有两个 I2S 端口 (0和1)，我们分别用于输入和输出。
 void i2s_install() {
-  // --- 配置麦克风 (I2S0) ---
+   // -----------------------------------------------------------
+  // 1. 配置 I2S_NUM_0 用于麦克风 (录音/输入)
+  // -----------------------------------------------------------
   i2s_config_t i2s_config_mic = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX), // 主机模式，接收数据
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,        // 16位采样精度
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,         // 单声道 (左声道)
     .communication_format = I2S_COMM_FORMAT_I2S,         // 标准 I2S 格式
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,            //最低优先级
     .dma_buf_count = 8,                                  // DMA 缓冲区数量
     .dma_buf_len = 64,                                   // 每个缓冲区长度
-    .use_apll = false
+    .use_apll = false                                  // 不使用 APLL (高精度音频锁相环)，使用普通时钟源以节省功耗
   };
-  i2s_driver_install(I2S_NUM_0, &i2s_config_mic, 0, NULL);
+  i2s_driver_install(I2S_NUM_0, &i2s_config_mic, 0, NULL);  // 安装驱动：根据上面的配置初始化 I2S_NUM_0 硬件
   
+  // 引脚映射配置：将 I2S_NUM_0 的信号连接到具体的 GPIO 引脚
   i2s_pin_config_t pin_config_mic = {
     .bck_io_num = MIC_I2S_SCK,
     .ws_io_num = MIC_I2S_WS,
     .data_out_num = -1,            // 麦克风不需要输出引脚
     .data_in_num = MIC_I2S_SD      // 麦克风数据输入引脚
   };
+  // 应用引脚配置
   i2s_set_pin(I2S_NUM_0, &pin_config_mic);
-
-  // --- 配置扬声器 (I2S1) ---
+  // -----------------------------------------------------------
+  // 2. 配置 I2S_NUM_1 用于扬声器 (播放/输出)
+  // -----------------------------------------------------------
   i2s_config_t i2s_config_amp = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX), // 主机模式，发送数据
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),   // 模式：主机(Master) + 发送(TX)    ESP32 产生时钟并将数据推送到扬声器
+    // 以下参数必须与录音配置保持一致，否则声音会变调或失真
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
@@ -101,55 +107,73 @@ void i2s_install() {
     .dma_buf_len = 64,
     .use_apll = false
   };
+   // 安装驱动：初始化 I2S_NUM_1 硬件
   i2s_driver_install(I2S_NUM_1, &i2s_config_amp, 0, NULL);
-  
+  // 引脚映射配置
   i2s_pin_config_t pin_config_amp = {
     .bck_io_num = AMP_I2S_BCLK,
     .ws_io_num = AMP_I2S_LRC,
     .data_out_num = AMP_I2S_DIN,   // 扬声器数据输出引脚
     .data_in_num = -1              // 扬声器不需要输入引脚
   };
+  // 应用引脚配置
   i2s_set_pin(I2S_NUM_1, &pin_config_amp);
 }
 
 // 创建 WAV 文件头
 // PCM 音频数据是“裸数据”，需要加上这个 44 字节的头，播放器才能识别
 void createWavHeader(uint8_t *header, int waveDataSize) {
-  int sampleRate = SAMPLE_RATE;
-  int byteRate = sampleRate * 2; // 16bit = 2bytes
-  int totalDataLen = waveDataSize + 36;
+ 
+  int sampleRate = SAMPLE_RATE;        // 16000
+  int byteRate = sampleRate * 2;       // 字节率 = 16000 * 2 (16位是2字节) * 1 (单声道) = 32000
+  int totalDataLen = waveDataSize + 36;// 文件总长度 = 音频长度 + 36字节(除了前8字节后的头部长度)
   
   // RIFF Chunk
+  // [0-3] 固定标记 "RIFF"
   header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  // [4-7] 文件总长度 (小端序拆分)
   header[4] = (byte)(totalDataLen & 0xFF);
   header[5] = (byte)((totalDataLen >> 8) & 0xFF);
   header[6] = (byte)((totalDataLen >> 16) & 0xFF);
-  header[7] = (byte)((totalDataLen >> 24) & 0xFF);
+  header[7] = (byte)((totalDataLen >> 24) & 0xFF); 
+  // [8-11] 固定标记 "WAVE"
   header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
-  
+
   // fmt Chunk
+  // [12-15] 固定标记 "fmt " (注意最后有个空格)
   header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
-  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0; // Chunk size: 16
-  header[20] = 1; header[21] = 0; // Format code: 1 (PCM)
-  header[22] = 1; header[23] = 0; // Channels: 1 (Mono)
+  // [16-19] 格式块长度，PCM 格式固定为 16
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+  // [20-21] 编码格式，1 代表 PCM (无压缩)
+  header[20] = 1; header[21] = 0; 
+  // [22-23] 声道数，1 代表单声道
+  header[22] = 1; header[23] = 0; 
+  // [24-27] 采样率 (16000)，同样需要拆分成4个字节
   header[24] = (byte)(sampleRate & 0xFF);
   header[25] = (byte)((sampleRate >> 8) & 0xFF);
   header[26] = (byte)((sampleRate >> 16) & 0xFF);
   header[27] = (byte)((sampleRate >> 24) & 0xFF);
+  // [28-31] 字节率 (每秒播放多少字节)，播放器用它计算缓冲
   header[28] = (byte)(byteRate & 0xFF);
   header[29] = (byte)((byteRate >> 8) & 0xFF);
   header[30] = (byte)((byteRate >> 16) & 0xFF);
   header[31] = (byte)((byteRate >> 24) & 0xFF);
-  header[32] = 2; header[33] = 0; // Block align: 2 bytes
-  header[34] = 16; header[35] = 0; // Bits per sample: 16
-  
+  // [32-33] 块对齐 (每个采样点占几字节)，16位单声道 = 2字节
+  header[32] = 2; header[33] = 0; 
+  // [34-35] 位深 (Bits per sample)，16位
+  header[34] = 16; header[35] = 0;
+
   // data Chunk
+  // [36-39] 固定标记 "data"
   header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  
+  // [40-43] 纯音频数据的长度 (不包含头部)
   header[40] = (byte)(waveDataSize & 0xFF);
   header[41] = (byte)((waveDataSize >> 8) & 0xFF);
   header[42] = (byte)((waveDataSize >> 16) & 0xFF);
   header[43] = (byte)((waveDataSize >> 24) & 0xFF);
 }
+
 
 // ================= 上传函数 =================
 // 将录制好的音频数据通过 HTTP POST 上传到服务器
@@ -160,6 +184,8 @@ void performUpload() {
     return;
   }
   
+
+
   // 2. 连接服务器
   showStatus("Connecting...", host);
   WiFiClient client;
@@ -167,6 +193,8 @@ void performUpload() {
     showStatus("Error:", "Connect Fail"); // 连接失败
     return;
   }
+  
+
   
   // 3. 准备上传
   showStatus("Uploading...", String(current_rec_len/1024) + " KB");
@@ -326,6 +354,9 @@ void ButtonTask(void *pvParameters) {
   }
 }
 
+
+
+
 // ================= Setup 初始化 =================
 void setup() {
   Serial.begin(115200);
@@ -372,6 +403,7 @@ void setup() {
   // ButtonTask 优先级中 (2)，运行在核心 1
   xTaskCreatePinnedToCore(ButtonTask, "BtnTask", 2048, NULL, 2, NULL, 1);
 }
+
 
 // ================= Loop =================
 void loop() {
