@@ -1,14 +1,16 @@
-
 from django.urls import path
 from . import views
 
-# 这里定义具体的门牌号
 urlpatterns = [
-    # 如果访问 /api/upload/ -> 就找 views.receive_data 干活
-    path('upload/', views.receive_data),
+    # 你的单片机代码里写的 url 是 "/api/upload/"
+    path('api/upload/', views.receive_data, name='api_upload'), 
     
-    # 如果访问 /api/history/ -> 就找 views.get_history 干活
-    path('history/', views.get_history),
+    # 获取历史记录 (你原来的接口)
+    path('api/history/', views.get_history, name='get_history'),
+    
+    # 网页 ECharts 获取频谱数据的新接口
+    path('api/get_audio_data/', views.get_audio_data, name='get_audio_data'),
+    
+    # 网页界面 (确保之前给你写的 HTML 代码放在了 templates/index.html 里面)
+    path('', views.index_page, name='index'), 
 ]
-
-
