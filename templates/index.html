@@ -2,56 +2,157 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>ESP32 频谱分析</title>
+    <title>ESP32 自适应降噪系统 - 数据分析控制台</title>
     <script src="https://cdn.staticfile.net/echarts/5.4.3/echarts.min.js"></script>
     <style>
-        body { background-color: #f0f2f5; font-family: sans-serif; padding: 20px; }
-        h2 { text-align: center; color: #333; }
-        .container { display: flex; gap: 20px; }
-        .box { flex: 1; height: 450px; background: #fff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); padding: 10px; }
+        body { background-color: #f4f7f6; font-family: 'Microsoft YaHei', sans-serif; padding: 20px; color: #333; }
+        h1 { text-align: center; margin-bottom: 30px; }
+        .grid-container { display: flex; gap: 20px; justify-content: center; }
+        .panel { flex: 1; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        .panel-header { display: flex; flex-direction: column; gap: 15px; margin-bottom: 20px; border-bottom: 2px solid #eee; padding-bottom: 20px; }
+        .control-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        select { padding: 8px; border-radius: 6px; border: 1px solid #ccc; flex: 1; font-size: 14px; }
+        .download-btn { background: #1890ff; color: white; text-decoration: none; padding: 8px 15px; border-radius: 6px; font-size: 14px; }
+        .download-btn:hover { background: #40a9ff; }
+        audio { height: 40px; outline: none; flex: 2; }
+        .chart { height: 400px; width: 100%; }
+        .refresh-btn { display: block; margin: 0 auto 20px auto; padding: 10px 20px; background: #52c41a; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; }
+        .refresh-btn:hover { background: #73d13d; }
     </style>
 </head>
 <body>
-    <h2>自适应语音降噪与频谱分析系统</h2>
-    <div class="container">
-        <div id="rawChart" class="box"></div>
-        <div id="processedChart" class="box"></div>
+
+    <h1>ESP32 语音降噪与频谱分析系统</h1>
+    <button class="refresh-btn" onclick="fetchHistory()">🔄 获取最新单片机上传记录</button>
+
+    <div class="grid-container">
+        <div class="panel">
+            <h2 style="color: #ff4d4f;">原始环境音 (降噪前)</h2>
+            <div class="panel-header">
+                <div class="control-row">
+                    <label>选择记录：</label>
+                    <select id="rawSelect" onchange="onRecordChange('raw')"></select>
+                </div>
+                <div class="control-row">
+                    <audio id="rawPlayer" controls></audio>
+                    <a id="rawDownload" class="download-btn" href="#" download>📥 导出 MATLAB</a>
+                </div>
+            </div>
+            <div id="rawChart" class="chart"></div>
+        </div>
+
+        <div class="panel">
+            <h2 style="color: #52c41a;">纯净人声 (降噪后)</h2>
+            <div class="panel-header">
+                <div class="control-row">
+                    <label>选择记录：</label>
+                    <select id="processedSelect" onchange="onRecordChange('processed')"></select>
+                </div>
+                <div class="control-row">
+                    <audio id="processedPlayer" controls></audio>
+                    <a id="processedDownload" class="download-btn" href="#" download>📥 导出 MATLAB</a>
+                </div>
+            </div>
+            <div id="processedChart" class="chart"></div>
+        </div>
     </div>
 
     <script>
-        // 1. 初始化图表
+        // 初始化 ECharts
         var rawChart = echarts.init(document.getElementById('rawChart'));
         var processedChart = echarts.init(document.getElementById('processedChart'));
 
-        // 2. 基础配置模板
-        function getOpt(title, color) {
+        function getOpt(color) {
             return {
-                title: { text: title, left: 'center' },
                 tooltip: { trigger: 'axis' },
-                xAxis: { type: 'category', name: 'Hz' },
-                yAxis: { type: 'value', name: '振幅' },
+                xAxis: { type: 'category', name: '频率(Hz)' },
+                yAxis: { type: 'value', name: '相对振幅' },
                 series: [{ data: [], type: 'line', itemStyle: { color: color }, symbol: 'none' }]
             };
         }
+        rawChart.setOption(getOpt('#ff4d4f'));
+        processedChart.setOption(getOpt('#52c41a'));
 
-        rawChart.setOption(getOpt('降噪前 (原始环境音)', '#ff4d4f'));
-        processedChart.setOption(getOpt('降噪后 (纯净人声)', '#52c41a'));
+        // 全局存储历史记录
+        let historyData = { raw: [], processed: [] };
 
-        // 3. 每 2 秒拉取一次 Django 的数据
-        setInterval(() => {
-            // 使用相对路径，无论你 IP 是多少都不会错
-            fetch('/api/get_audio_data/')
+        // 1. 获取历史记录列表
+        function fetchHistory() {
+            fetch('/api/history/')
+                .then(res => res.json())
+                .then(res => {
+                    historyData.raw = [];
+                    historyData.processed = [];
+                    
+                    // 将数据按 raw 和 processed 分类
+                    res.data.forEach(item => {
+                        // 只要文件名里包含 raw（不区分大小写）就归为左边
+                        if(item.url.toLowerCase().includes('raw')) {
+                            historyData.raw.push(item);
+                        } else {
+                            historyData.processed.push(item);
+                        }
+                    });
+
+                    // 填充下拉菜单
+                    populateSelect('rawSelect', historyData.raw);
+                    populateSelect('processedSelect', historyData.processed);
+
+                    // 默认触发加载最新的一条记录的波形
+                    if(historyData.raw.length > 0) onRecordChange('raw');
+                    if(historyData.processed.length > 0) onRecordChange('processed');
+                });
+        }
+
+        // 填充下拉菜单函数
+        function populateSelect(selectId, dataList) {
+            const select = document.getElementById(selectId);
+            select.innerHTML = '';
+            dataList.forEach((item, index) => {
+                const option = document.createElement('option');
+                option.value = index; // 存入数组索引
+                option.text = `[${item.id}] 时间: ${item.time}`;
+                select.appendChild(option);
+            });
+        }
+
+        // 2. 当用户切换下拉菜单时触发
+        function onRecordChange(type) {
+            const selectId = type === 'raw' ? 'rawSelect' : 'processedSelect';
+            const index = document.getElementById(selectId).value;
+            const selectedItem = historyData[type][index];
+
+            if (!selectedItem) return;
+
+            // 1. 更新播放器和下载链接
+            const player = document.getElementById(type + 'Player');
+            const downloadLink = document.getElementById(type + 'Download');
+            
+            player.src = selectedItem.url;
+            downloadLink.href = selectedItem.url;
+            downloadLink.download = `${type}_audio_${selectedItem.time.replace(/[: ]/g, '_')}.wav`; // 自动重命名方便matlab读取
+
+            // 2. 向后端请求该记录的 FFT 波形数据
+            const chart = type === 'raw' ? rawChart : processedChart;
+            chart.showLoading(); // 显示加载动画
+
+            fetch(`/api/get_fft_by_id/?id=${selectedItem.id}`)
                 .then(res => res.json())
                 .then(data => {
-                    if(data.raw.fft_freq.length > 0) {
-                        rawChart.setOption({ xAxis: { data: data.raw.fft_freq }, series: [{ data: data.raw.fft_mag }] });
+                    chart.hideLoading();
+                    if (data.status === 'success') {
+                        chart.setOption({
+                            xAxis: { data: data.fft_freq },
+                            series: [{ data: data.fft_mag }]
+                        });
+                    } else {
+                        alert("获取波形失败: " + data.error);
                     }
-                    if(data.processed.fft_freq.length > 0) {
-                        processedChart.setOption({ xAxis: { data: data.processed.fft_freq }, series: [{ data: data.processed.fft_mag }] });
-                    }
-                })
-                .catch(err => console.log("正在等待单片机上传数据..."));
-        }, 2000);
+                });
+        }
+
+        // 页面加载时自动获取一次记录
+        window.onload = fetchHistory;
     </script>
 </body>
 </html>
